@@ -13,6 +13,30 @@ import torch
 import torch._dynamo.config
 import torch._inductor.config
 
+
+# 这段代码是一个Python脚本，使用PyTorch和其他库实现了一个基于Transformer模型的文本生成工具。它可以用来生成人类语言文本，如对话或故事续写。脚本由几个主要部分组成：模型配置、文本采样、模型装载以及文本生成的主函数。
+
+# 导入模块和设置：代码的开始部分导入了所需的库和函数，并对一些特殊的PyTorch配置进行了设置。torch._inductor.config用于设置一些内部优化。
+
+# 定义采样和解码函数：定义了一系列函数来处理文本生成的过程，包括多项式采样、将逻辑回归值转换为概率、预填充模型、解码一个和多个标记等。
+
+# 定义模型前向推理函数：model_forward用于执行模型的前向传递，接收输入张量和位置标记。
+
+# 推测性解码：speculative_decode函数试图用一个次优的模型（称为草案模型）来加速生成过程，通过并行推理草案模型的输出。如果草案模型的预测被采纳，则使用它们；否则，将使用主模型重新生成。
+
+# 生成函数：generate函数是实际生成文本的核心函数。它可以以交互式或非交互式模式运行，使用主模型和可选的草案模型来推测性生成文本。
+
+# 编码和装载模型：提供了加载预训练模型和对输入文本编码的函数。
+
+# 主函数：main函数处理命令行参数，并使用上述函数生成文本样本。它也负责根据参数控制是否编译模型，以及是否在交互模式下运行。
+
+# 命令行参数解析：脚本的最后部分使用argparse处理命令行参数，如提示文本、样本数、新标记的最大数量等。
+
+# 整体来说，这个脚本提供了一个端到端的文本生成流程，从装载预训练的Transformer模型到基于给定提示文本生成新的文本内容。它包括一些高级特性，如推测性执行和动态编译，以提高效率和性能。
+
+# 请注意，这个脚本需要与一个现有的Transformer模型和相应的权重、配置文件以及一个分词器来使用。以上描述的代码仅为代码逻辑的纲要，若要正确运行，需要有相应的环境和支持文件。
+
+
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
@@ -76,6 +100,13 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
 def model_forward(model, x, input_pos):
     return model(x, input_pos)
 
+
+# 使用草案模型（draft_model）在给定的当前标记（cur_token）之后串行生成speculate_k个标记。这是一种快速但可能不够准确的预测方法。
+
+# 使用原始模型（model）并行生成相同数量的标记，并计算这些标记的概率。
+
+# 对于每个位置，比较两个模型生成的标记的概率。如果原始模型给出的概率不低于草案模型的概率，就接受这个标记；否则，用原始模型的概率重新进行多项式采样以选择一个新的标记。
+
 def speculative_decode(
     model: Transformer,
     draft_model: Transformer,
@@ -84,12 +115,14 @@ def speculative_decode(
     speculate_k: int,
     **sampling_kwargs
 ) -> torch.Tensor:
+    # 使用草案模型串行推断
     # draft model inference sequentially
     device = cur_token.device
     orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
     draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
 
     draft_tokens = torch.cat(draft_tokens)
+     # 使用目标模型并行推断草案标记
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
@@ -101,15 +134,19 @@ def speculative_decode(
     # q: target prob, p: draft prob
     # q >= p: always accept draft token
     # q < p: q/p prob to accept draft token
+    # q: 目标概率, p: 草案概率
+    # 如果q >= p，始终接受草案标记
+    # 如果q < p，以q/p的概率接受草案标记
     p = draft_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
     q = target_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
     accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k]/ p)
     rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
-
+    # 如果所有草案标记都被接受
     if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
         accept_length = speculate_k + 1
         last_token = multinomial_sample_one_no_sync(target_probs[-1])
         # fill last token into draft model
+        # 将最后一个标记填入草案模型
         model_forward(
             draft_model,
             draft_tokens[-1].view(1, -1),
@@ -117,6 +154,7 @@ def speculative_decode(
         )
         return torch.cat([draft_tokens, last_token])
     else:
+        # 某些标记被拒绝，选择新的标记替换被拒绝的标记
         accept_length = rejected_locations[0].item()
         p = draft_probs[accept_length]
         q = target_probs[accept_length]
